@@ -1,0 +1,1 @@
+conda create -n seed-voken python=3.8.8 -y && conda run -n seed-voken pip install -r requirements.txt
