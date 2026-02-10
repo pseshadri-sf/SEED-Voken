@@ -12,3 +12,4 @@ transformers==4.37.2
 lpips
 av
 decord
+boto3

@@ -1,6 +1,6 @@
 import os
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageFile
 from omegaconf import OmegaConf
 from torch.utils.data import Dataset
 import boto3
@@ -8,7 +8,13 @@ from botocore.exceptions import ClientError
 from io import BytesIO
 
 from src.Open_MAGVIT2.data.base import ImagePaths
-from src.Open_MAGVIT2.util import retrieve
+from src.Open_MAGVIT2.util import retrieve, KeyNotFoundError
+
+import logging
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger(__name__)
+
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 
 class S3ImagePaths(Dataset):
@@ -126,11 +132,22 @@ class S3ImagesBase(Dataset):
         # Get S3 configuration
         self.bucket = retrieve(self.config, "bucket", default=None)
         self.object_prefix = retrieve(self.config, "object", default="")
-        self.aws_access_key_id = retrieve(self.config, "aws_access_key_id", default=None)
-        self.aws_secret_access_key = retrieve(self.config, "aws_secret_access_key", default=None)
-        self.aws_session_token = retrieve(self.config, "aws_session_token", default=None)
+        try:
+            self.aws_access_key_id = retrieve(self.config, "aws_access_key_id", default=None)
+            self.aws_secret_access_key = retrieve(self.config, "aws_secret_access_key", default=None)
+            self.aws_session_token = retrieve(self.config, "aws_session_token", default=None)
+        except KeyNotFoundError:
+            log.info("No AWS credentials found in config, fetching from environment variables.")
+            self.aws_access_key_id = os.getenv("AWS_ACCESS_KEY_ID", None)
+            self.aws_secret_access_key = os.getenv("AWS_SECRET_ACCESS_KEY", None)
+            self.aws_session_token = os.getenv("AWS_SESSION_TOKEN", None)
         self.region_name = retrieve(self.config, "region_name", default=None)
-        self.cache_dir = retrieve(self.config, "cache_dir", default=None)
+        try:
+            self.cache_dir = retrieve(self.config, "cache_dir", default=None)
+            os.makedirs(self.cache_dir, exist_ok=True)
+        except KeyNotFoundError:
+            log.info("No cache directory found in config")
+            self.cache_dir = None
         
         if self.bucket is None:
             raise ValueError("'bucket' must be specified in config")

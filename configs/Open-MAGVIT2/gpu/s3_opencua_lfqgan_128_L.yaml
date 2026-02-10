@@ -3,7 +3,7 @@ trainer:
   accelerator: gpu
   strategy: ddp_find_unused_parameters_true
   devices: 1
-  num_nodes: 4
+  num_nodes: 1
   precision: 16-mixed
   max_epochs: 350
   check_val_every_n_epoch: 1
@@ -82,7 +82,7 @@ data:
           # aws_secret_access_key: null
           # aws_session_token: null
           # Optional: uncomment to enable local caching of downloaded images
-          # cache_dir: /tmp/s3_opencua_cache
+          #cache_dir: /tmp/s3_opencua_cache
     validation:
       target: src.Open_MAGVIT2.data.s3_images.S3Images
       params:

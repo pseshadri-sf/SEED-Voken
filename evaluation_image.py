@@ -26,8 +26,8 @@ from src.Open_MAGVIT2.models.lfqgan import VQModel
 ### When using pretrain setup
 # from src.Open_MAGVIT2.models.lfqgan_pretrain import VQModel
 from src.IBQ.models.ibqgan import IBQ
-### When using pretrain setup
-from src.IBQ.models.ibqgan_pretrain import VQModel
+### When using pretrain setup (use alias so Open-MAGVIT2 keeps lfqgan.VQModel)
+# from src.IBQ.models.ibqgan_pretrain import VQModel
 from metrics.inception import InceptionV3
 import lpips
 from skimage.metrics import peak_signal_noise_ratio as psnr_loss
@@ -52,9 +52,16 @@ def load_config(config_path, display=False):
     return config
 
 def load_vqgan_new(config, model_type, ckpt_path=None, is_gumbel=False):
-    model = MODEL_TYPE[model_type](**config.model.init_args) 
+    model = MODEL_TYPE[model_type](**config.model.init_args)
     if ckpt_path is not None:
-        sd = torch.load(ckpt_path, map_location="cpu")["state_dict"]
+        try:
+            ckpt = torch.load(ckpt_path, map_location="cpu")
+        except Exception as e:
+            raise RuntimeError(
+                f"Checkpoint file is corrupted or incomplete: {ckpt_path}\n"
+                "Try another checkpoint (e.g. an earlier epoch) or re-save the checkpoint."
+            ) from e
+        sd = ckpt["state_dict"]
         missing, unexpected = model.load_state_dict(sd, strict=False)
     return model.eval()
 
@@ -149,6 +156,17 @@ def get_args():
     parser.add_argument("--image_size", default=128, type=int)
     parser.add_argument("--batch_size", default=4, type=int)
     parser.add_argument("--model", choices=["Open-MAGVIT2", "IBQ"])
+    parser.add_argument(
+        "--save_comparison_dir",
+        default=None,
+        type=str,
+        help="If set, save input and reconstructed images here for comparison (input/, output/, comparison/ side-by-side).",
+    )
+    parser.add_argument(
+        "--save_native_resolution",
+        action="store_true",
+        help="When saving comparisons, also save raw input and output at native (original) resolution. Requires file paths in the batch (e.g. LocalImages). Output is upscaled to match input size.",
+    )
 
     return parser.parse_args()
 
@@ -193,6 +211,26 @@ def main(args):
 
     num_images = 0
     num_iter = 0
+    save_dir = getattr(args, "save_comparison_dir", None)
+    save_native = getattr(args, "save_native_resolution", False)
+    if save_dir:
+        save_dir = os.path.expanduser(save_dir)
+        input_dir = os.path.join(save_dir, "input")
+        output_dir = os.path.join(save_dir, "output")
+        comparison_dir = os.path.join(save_dir, "comparison")
+        for d in (input_dir, output_dir, comparison_dir):
+            os.makedirs(d, exist_ok=True)
+        if save_native:
+            input_native_dir = os.path.join(save_dir, "input_native")
+            output_native_dir = os.path.join(save_dir, "output_native")
+            comparison_native_dir = os.path.join(save_dir, "comparison_native")
+            for d in (input_native_dir, output_native_dir, comparison_native_dir):
+                os.makedirs(d, exist_ok=True)
+            print(f"Saving input/output comparison images to {save_dir} (including native resolution)")
+        else:
+            print(f"Saving input/output comparison images to {save_dir}")
+        global_idx = 0
+
     with torch.no_grad():
         for batch in tqdm(dataset._val_dataloader()):
             images = batch["image"].permute(0, 3, 1, 2).to(DEVICE)
@@ -225,6 +263,42 @@ def main(args):
 
             images = (images + 1) / 2
             reconstructed_images = (reconstructed_images + 1) / 2
+
+            # save input and output for comparison (optional)
+            if save_dir:
+                B = images.shape[0]
+                paths = batch.get("file_path_")  # available for LocalImages / ImagePaths
+                for i in range(B):
+                    inp = (images[i].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                    out = (reconstructed_images[i].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                    idx = global_idx + i
+                    Image.fromarray(inp).save(os.path.join(input_dir, f"{idx:05d}.png"))
+                    Image.fromarray(out).save(os.path.join(output_dir, f"{idx:05d}.png"))
+                    # side-by-side: input | output
+                    side_by_side = Image.new("RGB", (inp.shape[1] * 2, inp.shape[0]))
+                    side_by_side.paste(Image.fromarray(inp), (0, 0))
+                    side_by_side.paste(Image.fromarray(out), (inp.shape[1], 0))
+                    side_by_side.save(os.path.join(comparison_dir, f"{idx:05d}.png"))
+                    # native resolution: raw input + output upscaled to match
+                    if save_native and paths is not None:
+                        try:
+                            p = paths[i]
+                            path = str(p.item()) if hasattr(p, "item") else str(p)
+                            raw = Image.open(path).convert("RGB")
+                            raw_arr = np.array(raw)
+                            w, h = raw.size
+                            out_pil = Image.fromarray(out)
+                            out_upscaled = out_pil.resize((w, h), Image.Resampling.LANCZOS)
+                            raw.save(os.path.join(input_native_dir, f"{idx:05d}.png"))
+                            out_upscaled.save(os.path.join(output_native_dir, f"{idx:05d}.png"))
+                            comp_native = Image.new("RGB", (w * 2, h))
+                            comp_native.paste(raw, (0, 0))
+                            comp_native.paste(out_upscaled, (w, 0))
+                            comp_native.save(os.path.join(comparison_native_dir, f"{idx:05d}.png"))
+                        except Exception as e:
+                            import warnings
+                            warnings.warn(f"Native-resolution save failed for index {idx}: {e}")
+                global_idx += B
 
             # calculate fid
             pred_x = inception_model(images)[0]
