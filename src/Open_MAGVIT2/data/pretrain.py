@@ -8,12 +8,11 @@ import lightning as L
 from omegaconf import OmegaConf
 import json
 import torchvision.transforms as T
+from torchvision.io import decode_image
 import webdataset as wds
 import os
-from PIL import Image
-import io
 import numpy as np
-from torch.utils.data import DataLoader,get_worker_info
+from torch.utils.data import DataLoader, get_worker_info
 import random
 from multiprocessing import Value
 from copy import deepcopy
@@ -92,16 +91,17 @@ class Iter_ds(torch.utils.data.IterableDataset):
             if self.configs["enable_image"]:
                 image_keys = self.configs["image_key"]
                 for image_key in image_keys:
-                    if image_key in item.keys(): ## control jpg, jpg.jpg, jpg.jpeg
+                    if image_key in item.keys():  # control jpg, jpg.jpg, jpg.jpeg
                         image_data = item[image_key]
                         break
-                image = Image.open(io.BytesIO(image_data))
-                if not image.mode == "RGB":
-                    image = image.convert("RGB")
+                image = decode_image(
+                    torch.frombuffer(memoryview(image_data), dtype=torch.uint8),
+                    mode="RGB",
+                )
                 if self.image_transform:
-                    image = self.image_transform(image) #PIL 
-                image = np.array(image)
-                image = (image/127.5 - 1.0).astype(np.float32)
+                    image = self.image_transform(image)
+                image = image.permute(1, 2, 0).numpy()
+                image = (image / 127.5 - 1.0).astype(np.float32)
                 output["image_filename"] = item["__key__"]
                 output["image"] = image
 

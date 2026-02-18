@@ -58,6 +58,7 @@ data:
       target: src.Open_MAGVIT2.data.local_images.LocalImages
       params:
         config:
+          manifest_path: configs/Open-MAGVIT2/gpu/eval_ejepa_128_image_paths.json
           root: /root/workspace/SEED-Voken/test_data
           size: 128
           random_crop: false
@@ -66,6 +67,7 @@ data:
       target: src.Open_MAGVIT2.data.local_images.LocalImages
       params:
         config:
+          manifest_path: configs/Open-MAGVIT2/gpu/eval_ejepa_128_image_paths.json
           root: /root/workspace/SEED-Voken/test_data
           size: 128
           random_crop: false
@@ -74,6 +76,7 @@ data:
       target: src.Open_MAGVIT2.data.local_images.LocalImages
       params:
         config:
+          manifest_path: configs/Open-MAGVIT2/gpu/eval_ejepa_128_image_paths.json
           root: /root/workspace/SEED-Voken/test_data
           size: 128
           random_crop: false

@@ -4,6 +4,7 @@ lightning==2.2.0
 jsonargparse[signatures]==4.26.1
 tensorboard
 tensorboardx
+wandb
 albumentations==1.4.4
 omegaconf
 einops
@@ -13,3 +14,4 @@ lpips
 av
 decord
 boto3
+wandb

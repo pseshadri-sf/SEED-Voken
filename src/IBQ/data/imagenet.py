@@ -5,9 +5,10 @@ from tqdm import tqdm
 from PIL import Image
 import albumentations
 from omegaconf import OmegaConf
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, IterableDataset
+from torchvision.io import decode_image
 
-from src.IBQ.data.base import ImagePaths
+from src.IBQ.data.base import IterableImagePaths, load_image
 from src.IBQ.util import download, retrieve
 import src.IBQ.data.utils as bdu
 
@@ -38,7 +39,7 @@ def str_to_indices(string):
     return sorted(indices)
 
 
-class ImageNetBase(Dataset):
+class ImageNetBase(IterableDataset):
     def __init__(self, config=None):
         self.config = config or OmegaConf.create()
         if not type(self.config)==dict:
@@ -50,6 +51,9 @@ class ImageNetBase(Dataset):
 
     def __len__(self):
         return len(self.data)
+
+    def __iter__(self):
+        yield from self.data
 
     def __getitem__(self, i):
         return self.data[i]
@@ -114,11 +118,11 @@ class ImageNetBase(Dataset):
             "class_label": np.array(self.class_labels),
             "human_label": np.array(self.human_labels),
         }
-        self.data = ImagePaths(self.abspaths,
-                               labels=labels,
-                               size=retrieve(self.config, "size", default=0),
-                               random_crop=self.random_crop,
-                               original_reso = retrieve(self.config, "original_reso", default=False))
+        self.data = IterableImagePaths(self.abspaths,
+                                       labels=labels,
+                                       size=retrieve(self.config, "size", default=0),
+                                       random_crop=self.random_crop,
+                                       original_reso=retrieve(self.config, "original_reso", default=False))
 
 
 class ImageNetTrain(ImageNetBase):
@@ -316,7 +320,9 @@ class BaseWithDepth(Dataset):
         return len(self.base_dset)
 
     def preprocess_depth(self, path):
-        rgba = np.array(Image.open(path))
+        rgba = decode_image(path, mode="UNCHANGED").permute(1, 2, 0).numpy()
+        if rgba.shape[2] == 3:
+            rgba = np.concatenate([rgba, np.full((*rgba.shape[:2], 1), 255, dtype=rgba.dtype)], axis=2)
         depth = rgba_to_depth(rgba)
         depth = (depth - depth.min())/max(1e-8, depth.max()-depth.min())
         depth = 2.0*depth-1.0
@@ -401,16 +407,20 @@ class DRINExamples(Dataset):
         return len(self.image_paths)
 
     def preprocess_image(self, image_path):
-        image = Image.open(image_path)
-        if not image.mode == "RGB":
-            image = image.convert("RGB")
-        image = np.array(image).astype(np.uint8)
+        image = load_image(image_path)
+        if image.shape[0] == 1:
+            image = image.repeat(3, 1, 1)
+        elif image.shape[0] == 4:
+            image = image[:3]
+        image = image.permute(1, 2, 0).numpy().astype(np.uint8)
         image = self.preprocessor(image=image)["image"]
         image = (image/127.5 - 1.0).astype(np.float32)
         return image
 
     def preprocess_depth(self, path):
-        rgba = np.array(Image.open(path))
+        rgba = decode_image(path, mode="UNCHANGED").permute(1, 2, 0).numpy()
+        if rgba.shape[2] == 3:
+            rgba = np.concatenate([rgba, np.full((*rgba.shape[:2], 1), 255, dtype=rgba.dtype)], axis=2)
         depth = rgba_to_depth(rgba)
         depth = (depth - depth.min())/max(1e-8, depth.max()-depth.min())
         depth = 2.0*depth-1.0

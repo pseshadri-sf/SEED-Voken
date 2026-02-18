@@ -3,12 +3,18 @@ import numpy as np
 import torch
 from omegaconf import OmegaConf
 from torch.utils.data import Dataset, IterableDataset, get_worker_info
+import albumentations
 import boto3
 import random
 from botocore.exceptions import ClientError
 
-from src.Open_MAGVIT2.data.base import ImagePaths, load_image
-from src.Open_MAGVIT2.util import retrieve, KeyNotFoundError
+from src.IBQ.util import retrieve, KeyNotFoundError
+from src.IBQ.data.base import IterableImagePaths, load_image
+from src.manifest_utils import (
+    ensure_manifest,
+    get_failed_samples_path_from_manifest,
+    load_failed_paths,
+)
 from torchvision.io import decode_image, write_png
 
 import logging
@@ -19,6 +25,7 @@ log = logging.getLogger(__name__)
 class S3ImagePaths(IterableDataset):
     """
     IterableDataset that loads images sequentially from S3 (mitigates random reads).
+    Uses albumentations for preprocessing (same as IBQ ImagePaths).
     """
     def __init__(self, s3_keys, s3_client, bucket, size=None, random_crop=False,
                  original_reso=False, labels=None, cache_dir=None, shuffle=True, epoch=0):
@@ -36,15 +43,14 @@ class S3ImagePaths(IterableDataset):
         self.labels["file_path_"] = s3_keys
         self._length = len(s3_keys)
         if self.size is not None and self.size > 0:
-            import torchvision.transforms as T
-            self.rescaler = T.Resize(self.size)
+            self.rescaler = albumentations.SmallestMaxSize(max_size=self.size)
             if not self.random_crop:
-                self.cropper = T.CenterCrop((self.size, self.size))
+                self.cropper = albumentations.CenterCrop(height=self.size, width=self.size)
             else:
-                self.cropper = T.RandomCrop((self.size, self.size))
-            self.preprocessor = T.Compose([self.rescaler, self.cropper])
+                self.cropper = albumentations.RandomCrop(height=self.size, width=self.size)
+            self.preprocessor = albumentations.Compose([self.rescaler, self.cropper])
         else:
-            self.preprocessor = lambda x: x
+            self.preprocessor = lambda **kwargs: kwargs
 
     def __len__(self):
         return self._length
@@ -83,10 +89,10 @@ class S3ImagePaths(IterableDataset):
             image = image.repeat(3, 1, 1)
         elif image.shape[0] == 4:
             image = image[:3]
+        image = image.permute(1, 2, 0).numpy().astype(np.uint8)
         if not self.original_reso:
-            image = self.preprocessor(image)
-        image = image.permute(1, 2, 0).numpy()
-        image = (image/127.5 - 1.0).astype(np.float32)
+            image = self.preprocessor(image=image)["image"]
+        image = (image / 127.5 - 1.0).astype(np.float32)
         return image
 
     def _get_sample(self, i):
@@ -121,15 +127,23 @@ class S3ImagePaths(IterableDataset):
 class S3ImagesBase(IterableDataset):
     """
     Base class for loading images from S3, similar to ImageNetBase.
+    Optional skip_files (default True): exclude keys listed in failed_samples_path JSON if set.
     """
-    # Supported image extensions
     IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif', '.webp'}
-    
+
     def __init__(self, config=None):
         self.config = config or OmegaConf.create()
         if not type(self.config) == dict:
             self.config = OmegaConf.to_container(self.config)
-        
+
+        skip_files = retrieve(self.config, "skip_files", default=True)
+        failed_samples_path = retrieve(self.config, "failed_samples_path", default=None)
+        self._keys_to_skip = set()
+        if skip_files and failed_samples_path:
+            self._keys_to_skip = load_failed_paths(failed_samples_path, normalize=False)
+            if self._keys_to_skip:
+                log.info("Skipping %d keys from failed_samples: %s", len(self._keys_to_skip), failed_samples_path)
+
         # Get S3 configuration
         self.bucket = retrieve(self.config, "bucket", default=None)
         self.object_prefix = retrieve(self.config, "object", default="")
@@ -146,14 +160,15 @@ class S3ImagesBase(IterableDataset):
         self.endpoint_url = retrieve(self.config, "endpoint_url", default=None) or os.getenv("S3_ENDPOINT_URL", None)
         try:
             self.cache_dir = retrieve(self.config, "cache_dir", default=None)
-            os.makedirs(self.cache_dir, exist_ok=True)
+            if self.cache_dir is not None:
+                os.makedirs(self.cache_dir, exist_ok=True)
         except KeyNotFoundError:
             log.info("No cache directory found in config")
             self.cache_dir = None
-        
+
         if self.bucket is None:
             raise ValueError("'bucket' must be specified in config")
-        
+
         # Initialize S3 client
         s3_kwargs = {}
         if self.aws_access_key_id:
@@ -168,11 +183,9 @@ class S3ImagesBase(IterableDataset):
             s3_kwargs['endpoint_url'] = self.endpoint_url
 
         self.s3_client = boto3.client('s3', **s3_kwargs)
-        
-        # Get random_crop setting
+
         self.random_crop = retrieve(self.config, "random_crop", default=False)
-        
-        # List and load images
+
         self._load()
 
     def __len__(self):
@@ -191,71 +204,63 @@ class S3ImagesBase(IterableDataset):
         """
         image_keys = []
         paginator = self.s3_client.get_paginator('list_objects_v2')
-        
+
         try:
             pages = paginator.paginate(Bucket=bucket, Prefix=prefix)
-            
+
             for page in pages:
                 if 'Contents' not in page:
                     continue
-                
+
                 for obj in page['Contents']:
                     key = obj['Key']
-                    # Skip directories (keys ending with /)
-                    print(key)
                     if key.endswith('/'):
                         continue
-                    
-                    # Check if file has image extension
+
                     _, ext = os.path.splitext(key.lower())
                     if ext in self.IMAGE_EXTENSIONS:
-                        # Return relative path from prefix
                         if prefix and key.startswith(prefix):
                             rel_key = key[len(prefix):].lstrip('/')
                         else:
                             rel_key = key
-                        image_keys.append(key)  # Store full S3 key for access
-        
+                        image_keys.append(key)
+
         except ClientError as e:
             raise RuntimeError(f"Failed to list objects from S3 bucket '{bucket}' with prefix '{prefix}'. Error: {e}")
-        
+
         image_keys = sorted(image_keys)
         print(f"Found {len(image_keys)} images in s3://{bucket}/{prefix}")
         return image_keys
 
     def _filter_keys(self, keys):
-        """Filter S3 keys if needed (similar to _filter_relpaths in ImageNetBase)."""
-        # Can add filtering logic here if needed
-        return keys
+        """Filter S3 keys if needed (e.g. exclude failed samples when skip_files is True)."""
+        if not self._keys_to_skip:
+            return keys
+        return [k for k in keys if k not in self._keys_to_skip]
 
     def _load(self):
         """Load all image keys from S3 and create dataset."""
-        # List all images recursively from S3
         s3_keys = self._list_s3_images(self.bucket, self.object_prefix)
-        
+
         if len(s3_keys) == 0:
             raise ValueError(f"No images found in s3://{self.bucket}/{self.object_prefix}")
-        
-        # Filter keys if needed
+
         l1 = len(s3_keys)
         s3_keys = self._filter_keys(s3_keys)
         if l1 != len(s3_keys):
             print(f"Removed {l1 - len(s3_keys)} files during filtering.")
-        
-        # Extract relative paths for labels (remove prefix if present)
+
         if self.object_prefix:
-            relpaths = [key[len(self.object_prefix):].lstrip('/') if key.startswith(self.object_prefix) else key 
+            relpaths = [key[len(self.object_prefix):].lstrip('/') if key.startswith(self.object_prefix) else key
                        for key in s3_keys]
         else:
             relpaths = s3_keys
-        
-        # Create labels dictionary
+
         labels = {
             "relpath": np.array(relpaths),
             "s3_key": np.array(s3_keys),
         }
-        
-        # Create dataset using custom S3ImagePaths
+
         self.data = S3ImagePaths(
             s3_keys=s3_keys,
             s3_client=self.s3_client,
@@ -274,15 +279,155 @@ class S3Images(S3ImagesBase):
     Usage:
         config = {
             "bucket": "my-bucket",
-            "object": "path/to/images/",  # prefix/path in S3
+            "object": "path/to/images/",
             "size": 256,
             "random_crop": True,
             "aws_access_key_id": "optional",
             "aws_secret_access_key": "optional",
-            "region_name": "us-east-1",  # optional
+            "region_name": "us-east-1",
             "endpoint_url": "https://...",  # optional, for S3-compatible APIs (e.g. RunPod)
-            "cache_dir": "/tmp/s3_cache"  # optional, for caching downloaded images
+            "cache_dir": "/tmp/s3_cache"
         }
         dataset = S3Images(config=config)
+    """
+    pass
+
+
+# ---------------------------------------------------------------------------
+# Local directory dataloader (same interface as S3, but reads from disk)
+# ---------------------------------------------------------------------------
+
+DEFAULT_LOCAL_ROOT = "/workspace/models/EWM-DataCollection/images"
+
+
+def _list_local_images(root):
+    """Recursively list all image file paths under root. Returns sorted list of absolute paths."""
+    image_paths = []
+    for ext in S3ImagesBase.IMAGE_EXTENSIONS:
+        for dirpath, _, filenames in os.walk(root):
+            for f in filenames:
+                if os.path.splitext(f)[1].lower() == ext:
+                    image_paths.append(os.path.join(dirpath, f))
+    return sorted(image_paths)
+
+
+class LocalImagesBase(IterableDataset):
+    """
+    Base class for loading images from a local directory (IterableDataset for sequential reads).
+    Same config options as S3 (size, random_crop, original_reso) plus root path.
+    If manifest_path is set in config: use that JSON cache (build via build_local_ibqgan_image_paths.py if missing).
+    Optional skip_files (default True): exclude paths listed in the config's failed_samples JSON if present.
+    """
+    def __init__(self, config=None):
+        self.config = config or OmegaConf.create()
+        if not type(self.config) == dict:
+            self.config = OmegaConf.to_container(self.config)
+
+        skip_files = retrieve(self.config, "skip_files", default=True)
+        failed_samples_path = retrieve(self.config, "failed_samples_path", default=None)
+        manifest_path = retrieve(self.config, "manifest_path", default=None)
+        # When failed_samples_path is None, default to derived path from manifest so skip_files can apply
+        if failed_samples_path is None and manifest_path:
+            derived = get_failed_samples_path_from_manifest(manifest_path)
+            if derived:
+                derived = os.path.abspath(os.path.expanduser(derived))
+                if os.path.isfile(derived):
+                    failed_samples_path = derived
+        self._paths_to_skip = set()
+        if skip_files and failed_samples_path:
+            self._paths_to_skip = load_failed_paths(failed_samples_path, normalize=True)
+            if self._paths_to_skip:
+                log.info("Skipping %d paths from failed_samples: %s", len(self._paths_to_skip), failed_samples_path)
+
+        if manifest_path:
+            root_for_build = retrieve(self.config, "root", default=None)
+            if root_for_build:
+                root_for_build = os.path.abspath(os.path.expanduser(root_for_build))
+            self.root, abspaths = ensure_manifest(manifest_path, root=root_for_build)
+            self.random_crop = retrieve(self.config, "random_crop", default=False)
+            self._load_from_paths(abspaths)
+            return
+
+        self.root = retrieve(
+            self.config, "root", default=DEFAULT_LOCAL_ROOT
+        )
+        self.root = os.path.abspath(os.path.expanduser(self.root))
+        if not os.path.isdir(self.root):
+            raise FileNotFoundError(f"Image root directory not found: {self.root}")
+
+        self.random_crop = retrieve(self.config, "random_crop", default=False)
+        self._load()
+
+    def __len__(self):
+        return len(self.data)
+
+    def __iter__(self):
+        yield from self.data
+
+    def __getitem__(self, i):
+        return self.data[i]
+
+    def _filter_paths(self, paths):
+        """Filter paths if needed (e.g. exclude failed samples when skip_files is True)."""
+        if not self._paths_to_skip:
+            return paths
+        normalized = {os.path.normpath(os.path.abspath(p)) for p in paths}
+        kept = [p for p in paths if os.path.normpath(os.path.abspath(p)) not in self._paths_to_skip]
+        return kept
+
+    def _load_from_paths(self, abspaths):
+        """Create dataset from a precomputed list of absolute paths (e.g. from manifest)."""
+        if len(abspaths) == 0:
+            raise ValueError("No image paths in manifest.")
+        n_before = len(abspaths)
+        abspaths = self._filter_paths(abspaths)
+        if n_before != len(abspaths):
+            log.info("Removed %d files during filtering.", n_before - len(abspaths))
+        relpaths = [os.path.relpath(p, self.root) for p in abspaths]
+        labels = {"relpath": np.array(relpaths)}
+        self.data = IterableImagePaths(
+            abspaths,
+            size=retrieve(self.config, "size", default=0),
+            random_crop=self.random_crop,
+            original_reso=retrieve(self.config, "original_reso", default=False),
+            labels=labels,
+        )
+        log.info("Loaded %d images from manifest (root: %s)", len(self.data), self.root)
+
+    def _load(self):
+        """Discover all images under root and create dataset using ImagePaths (same preprocessing as IBQ)."""
+        abspaths = _list_local_images(self.root)
+        if len(abspaths) == 0:
+            raise ValueError(f"No images found under {self.root}")
+
+        n_before = len(abspaths)
+        abspaths = self._filter_paths(abspaths)
+        if n_before != len(abspaths):
+            log.info("Removed %d files during filtering.", n_before - len(abspaths))
+
+        relpaths = [os.path.relpath(p, self.root) for p in abspaths]
+        labels = {
+            "relpath": np.array(relpaths),
+        }
+
+        self.data = IterableImagePaths(
+            abspaths,
+            size=retrieve(self.config, "size", default=0),
+            random_crop=self.random_crop,
+            original_reso=retrieve(self.config, "original_reso", default=False),
+            labels=labels,
+        )
+        log.info("Found %d images in %s", len(self.data), self.root)
+
+
+class LocalImages(LocalImagesBase):
+    """
+    Dataset that loads all images from a local directory (recursive).
+    Same preprocessing as S3Images (albumentations, size, random_crop, original_reso).
+    Config:
+        root: path to image directory (default: /workspace/models/EWM-DataCollection/images)
+        size: resize/crop size (default 0 = no resize)
+        random_crop: use random crop for training (default False)
+        original_reso: if True, do not resize/crop (default False)
     """
     pass

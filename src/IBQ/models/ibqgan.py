@@ -7,6 +7,7 @@ from main import instantiate_from_config
 from collections import OrderedDict
 from contextlib import contextmanager
 
+from taming.modules.losses.lpips import OCR_CRAFT_LPIPS
 from src.IBQ.modules.diffusionmodules.model import Encoder, Decoder
 from src.IBQ.modules.vqvae.quantize import VectorQuantizer2 as VectorQuantizer
 from src.IBQ.modules.vqvae.quantize import IndexPropagationQuantize
@@ -39,6 +40,8 @@ class VQModel(L.LightningModule):
                 lr_drop_rate = 0.1,
                 use_ema = False,
                 stage = None,
+                ocr_loss = False,
+                accumulate_grad_batches = 1,
                  ):
         super().__init__()
         self.image_key = image_key
@@ -72,6 +75,13 @@ class VQModel(L.LightningModule):
         self.resume_lr = resume_lr
         self.lr_drop_epoch = lr_drop_epoch
         self.lr_drop_rate = lr_drop_rate
+        self.accumulate_grad_batches = accumulate_grad_batches
+        self.ocr_loss = ocr_loss
+        self.ocr_lpips = None
+        if self.ocr_loss:
+            self.ocr_lpips = OCR_CRAFT_LPIPS().eval()
+            for p in self.ocr_lpips.parameters():
+                p.requires_grad = False
 
         self.strict_loading = False
 
@@ -97,7 +107,7 @@ class VQModel(L.LightningModule):
         return super().load_state_dict(*args, strict=strict)
 
     def state_dict(self, *args, destination=None, prefix='', keep_vars=False):
-        return {k: v for k, v in super().state_dict(*args, destination, prefix, keep_vars).items() if ("inception_model" not in k and "lpips_vgg" not in k and "lpips_alex" not in k)}
+        return {k: v for k, v in super().state_dict(*args, destination, prefix, keep_vars).items() if ("inception_model" not in k and "lpips_vgg" not in k and "lpips_alex" not in k and "ocr_lpips" not in k)}
 
     def init_from_ckpt(self, path, ignore_keys=list(), stage="transformer"):
         sd = torch.load(path, map_location="cpu")["state_dict"]
@@ -230,23 +240,34 @@ class VQModel(L.LightningModule):
         # optimize discriminator
         discloss, log_dict_disc = self.loss(qloss, x, xrec, 1, self.global_step,
                                             last_layer=self.get_last_layer(), split="train")
-        opt_disc.zero_grad()
+        
+
+        #opt_disc.zero_grad()
         self.manual_backward(discloss)
-        opt_disc.step()
+        if self.global_step % self.accumulate_grad_batches == 0:
+            opt_disc.step()
+            opt_disc.zero_grad()
         self.log_dict(log_dict_disc, prog_bar=False, logger=True, on_step=True, on_epoch=True)
 
 
         # optimize generator
         aeloss, log_dict_ae = self.loss(qloss, x, xrec, 0, self.global_step,
                                         last_layer=self.get_last_layer(), split="train")
-        opt_gen.zero_grad()
+        if self.ocr_loss and self.ocr_lpips is not None:
+            ocr_loss_val = self.ocr_lpips(x, xrec).mean()
+            aeloss = aeloss + ocr_loss_val
+            log_dict_ae["train/ocr_loss"] = ocr_loss_val.detach()
+            
+        #opt_gen.zero_grad()
         self.manual_backward(aeloss)
 
 
         if self.gradient_clip_val > 0: # for cosine similarity
             self.clip_gradients(opt_gen, gradient_clip_val=self.gradient_clip_val, gradient_clip_algorithm="norm")
 
-        opt_gen.step()
+        if self.global_step % self.accumulate_grad_batches == 0:
+            opt_gen.step()
+            opt_gen.zero_grad()
         self.log_dict(log_dict_ae, prog_bar=False, logger=True, on_step=True, on_epoch=True)
 
         if self.scheduler_type != "None":
@@ -268,6 +289,9 @@ class VQModel(L.LightningModule):
         x_rec = self.decode(quant).clamp(-1, 1)
         aeloss, log_dict_ae = self.loss(qloss, x, x_rec, 0, self.global_step,
                                         last_layer=self.get_last_layer(), split="val")
+        if self.ocr_loss and self.ocr_lpips is not None:
+            ocr_loss_val = self.ocr_lpips(x, x_rec).mean()
+            log_dict_ae["val/ocr_loss"] = ocr_loss_val.detach()
 
         discloss, log_dict_disc = self.loss(qloss, x, x_rec, 1, self.global_step,
                                             last_layer=self.get_last_layer(), split="val")
@@ -367,6 +391,8 @@ class IBQ(VQModel):
                 resume_lr = None,
                 use_ema = False,
                 stage = None,
+                ocr_loss = False,
+                accumulate_grad_batches = 1,
                  ):
         z_channels = ddconfig["z_channels"]
         super().__init__(ddconfig,
@@ -390,7 +416,9 @@ class IBQ(VQModel):
                         use_ema = use_ema,
                         stage = stage,
                         lr_drop_epoch = lr_drop_epoch,
-                        lr_drop_rate = lr_drop_rate
+                        lr_drop_rate = lr_drop_rate,
+                        ocr_loss = ocr_loss,
+                        accumulate_grad_batches = accumulate_grad_batches,
                         )
         self.quantize = IndexPropagationQuantize(n_embed, embed_dim, beta, use_entropy_loss,
                                           remap=remap, cosine_similarity=cosine_similarity,
@@ -398,3 +426,147 @@ class IBQ(VQModel):
                                           sample_minimization_weight=sample_minimization_weight, batch_maximization_weight=batch_maximization_weight)
         if ckpt_path is not None:
             self.init_from_ckpt(ckpt_path, ignore_keys=ignore_keys, stage=stage)
+
+
+def _load_pretrained_state_dict(pretrained_path, ckpt_file, config_file="config.yaml"):
+    """Load state dict from pretrained dir (vision_tokenizer format). Used by IBQFromPretrained."""
+    import os.path as osp
+    from omegaconf import OmegaConf
+
+    cfg_path = osp.join(pretrained_path, config_file)
+    if not osp.exists(cfg_path):
+        raise FileNotFoundError(f"Pretrained config not found: {cfg_path}")
+    cfg = OmegaConf.load(cfg_path)
+
+    cfg_dict = OmegaConf.to_container(cfg, resolve=True)
+
+    ckpt_path = osp.join(pretrained_path, ckpt_file)
+    if not osp.exists(ckpt_path):
+        # try safetensors
+        alt = ckpt_file.replace(".ckpt", ".safetensors")
+        if alt != ckpt_file:
+            alt_path = osp.join(pretrained_path, alt)
+            if osp.exists(alt_path):
+                try:
+                    from safetensors.torch import load_file
+                    sd = load_file(alt_path)
+                    return cfg_dict, sd
+                except Exception as e:
+                    raise FileNotFoundError(f"Could not load {alt_path}: {e}") from e
+        raise FileNotFoundError(f"Pretrained checkpoint not found: {ckpt_path}")
+
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+    if isinstance(ckpt, dict) and "state_dict" in ckpt:
+        sd = ckpt["state_dict"]
+    else:
+        sd = ckpt
+    return cfg_dict, sd
+
+
+class IBQFromPretrained(IBQ):
+    """
+    IBQ model that loads generator weights from a pretrained vision tokenizer
+    (e.g. pretrained/ with config.yaml + model.ckpt as in src/vision_tokenizer).
+    Same training behavior as IBQ; only initialization differs.
+    """
+
+    def __init__(
+        self,
+        pretrained_path,
+        lossconfig,
+        config_file="config.yaml",
+        ckpt_file="model.ckpt",
+        ignore_keys=None,
+        image_key="image",
+        colorize_nlabels=None,
+        monitor=None,
+        remap=None,
+        sane_index_shape=False,
+        learning_rate=1e-4,
+        l2_normalize=False,
+        warmup_epochs=0,
+        scheduler_type="None",
+        min_learning_rate=0,
+        cosine_similarity=False,
+        gradient_clip_val=0,
+        use_entropy_loss=True,
+        sample_minimization_weight=1.0,
+        batch_maximization_weight=1.0,
+        entropy_temperature=0.01,
+        beta=0.25,
+        lr_drop_epoch=None,
+        lr_drop_rate=0.1,
+        resume_lr=None,
+        use_ema=True,
+        stage=None,
+        ocr_loss: bool = False,
+        accumulate_grad_batches = 1,
+        **kwargs,
+    ):
+        ignore_keys = ignore_keys or []
+        pretrained_cfg = _load_pretrained_state_dict(pretrained_path, ckpt_file, config_file)
+        cfg_dict, state_dict = pretrained_cfg
+
+        ddconfig = cfg_dict.get("ddconfig")
+        n_embed = cfg_dict.get("n_embed")
+        embed_dim = cfg_dict.get("embed_dim")
+        if ddconfig is None or n_embed is None or embed_dim is None:
+            raise KeyError(
+                "Pretrained config must contain ddconfig, n_embed, embed_dim. "
+                f"Got keys: {list(cfg_dict.keys())}"
+            )
+
+        # Optional overrides from pretrained config
+        beta = cfg_dict.get("beta", beta)
+        use_entropy_loss = cfg_dict.get("use_entropy_loss", use_entropy_loss)
+        cosine_similarity = cfg_dict.get("cosine_similarity", cosine_similarity)
+        entropy_temperature = cfg_dict.get("entropy_temperature", entropy_temperature)
+        sample_minimization_weight = cfg_dict.get("sample_minimization_weight", sample_minimization_weight)
+        batch_maximization_weight = cfg_dict.get("batch_maximization_weight", batch_maximization_weight)
+
+        super().__init__(
+            ddconfig=ddconfig,
+            lossconfig=lossconfig,
+            n_embed=n_embed,
+            embed_dim=embed_dim,
+            ckpt_path=None,
+            ignore_keys=ignore_keys,
+            image_key=image_key,
+            colorize_nlabels=colorize_nlabels,
+            monitor=monitor,
+            remap=remap,
+            sane_index_shape=sane_index_shape,
+            learning_rate=learning_rate,
+            l2_normalize=l2_normalize,
+            warmup_epochs=warmup_epochs,
+            scheduler_type=scheduler_type,
+            min_learning_rate=min_learning_rate,
+            gradient_clip_val=gradient_clip_val,
+            use_entropy_loss=use_entropy_loss,
+            sample_minimization_weight=sample_minimization_weight,
+            batch_maximization_weight=batch_maximization_weight,
+            entropy_temperature=entropy_temperature,
+            beta=beta,
+            lr_drop_epoch=lr_drop_epoch,
+            lr_drop_rate=lr_drop_rate,
+            resume_lr=resume_lr,
+            use_ema=use_ema,
+            stage=stage,
+            cosine_similarity=cosine_similarity,
+            ocr_loss=ocr_loss,
+            accumulate_grad_batches=accumulate_grad_batches,
+        )
+
+        # Load pretrained generator weights (encoder, decoder, quantize, quant_conv, post_quant_conv)
+        generator_prefixes = ("encoder.", "decoder.", "quantize.", "quant_conv.", "post_quant_conv.")
+        new_sd = OrderedDict()
+        for k, v in state_dict.items():
+            if any(k.startswith(p) for p in generator_prefixes):
+                if not any(ig in k for ig in ignore_keys):
+                    new_sd[k] = v
+        missing, unexpected = self.load_state_dict(new_sd, strict=False)
+        if missing:
+            print(f"IBQFromPretrained: missing keys (expected for loss/disc): {len(missing)}")
+        if unexpected:
+            print(f"IBQFromPretrained: unexpected keys from checkpoint: {unexpected[:10]}{'...' if len(unexpected) > 10 else ''}")
+        print(f"Restored generator from {pretrained_path} ({len(new_sd)} keys)")

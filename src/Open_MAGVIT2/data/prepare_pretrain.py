@@ -6,20 +6,16 @@ LAION-COCO, CC15M, LAION-Aesthetic-umap
 LAION-Aesthetic-v2, JourneyDB, LAION-HD
 """
 import webdataset as wds
-from PIL import Image
-import io
+import torch
 from torch.utils.data import DataLoader, default_collate
 import torchvision.transforms as T
+from torchvision.io import decode_image
 import os
 import json
 from omegaconf import OmegaConf
 from tqdm import tqdm
-import os
 import tarfile
 import pandas as pd
-from PIL import Image
-import io
-import json
 import multiprocessing as mp
 import datetime
 import warnings
@@ -28,24 +24,27 @@ warnings.simplefilter("always")
 def check_image(image_data, filter=True):
     save_image = False
     try:
-        with warnings.catch_warnings(record=True) as w:
-            image = Image.open(io.BytesIO(image_data))
+        with warnings.catch_warnings(record=True) as warning_list:
+            image = decode_image(
+                torch.frombuffer(memoryview(image_data), dtype=torch.uint8),
+                mode="RGB",
+            )
+            h, w = image.shape[1], image.shape[2]
             if filter:
-                w, h = image.size
-                if w >= 512 and h >= 512: ## filter low resolution and aspect ratio > 2
+                if w >= 512 and h >= 512:  # filter low resolution and aspect ratio > 2
                     horizational_aspect_ratio = w // h
                     vertical_aspect_ratio = h // w
                     if horizational_aspect_ratio > 2 or vertical_aspect_ratio > 2:
                         save_image = False
                     else:
                         save_image = True
+                else:
+                    save_image = False
             else:
                 save_image = True
-            if w:
+            if warning_list:
                 save_image = False
-                print(f"warning: {w[0].message}")
-            else:
-                save_image = True
+                print(f"warning: {warning_list[0].message}")
         return save_image
     except Exception as e:
         print(f"Error details: {str(e)}")

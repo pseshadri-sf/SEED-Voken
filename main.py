@@ -1,5 +1,5 @@
 import argparse, os, sys, datetime, glob, importlib
-from torch.utils.data import random_split, DataLoader, Dataset
+from torch.utils.data import random_split, DataLoader, Dataset, IterableDataset
 
 import lightning as L
 from lightning.pytorch.cli import LightningCLI
@@ -70,17 +70,21 @@ class DataModuleFromConfig(L.LightningDataModule):
                 self.datasets[k] = instantiate_from_config(self.dataset_configs[k]).create_dataset()
         if self.wrap:
             for k in self.datasets:
-                self.datasets[k] = WrappedDataset(self.datasets[k])
+                # Don't wrap IterableDataset; DataLoader must use iter() for sequential reads
+                if not isinstance(self.datasets[k], IterableDataset):
+                    self.datasets[k] = WrappedDataset(self.datasets[k])
 
     def _train_dataloader(self):
         """
         laion serves as the train loader
         """
-        if "pretrain" in self.dataset_configs["train"]["target"]: ## webdataset no need for shuffle=True
-            return DataLoader(self.datasets["train"], batch_size=self.batch_size, num_workers=self.num_workers, pin_memory=True)
-        else:
-            return DataLoader(self.datasets["train"], batch_size=self.batch_size,
-                          num_workers=self.num_workers, shuffle=True, collate_fn=custom_collate, pin_memory=True)
+        train_ds = self.datasets["train"]
+        if "pretrain" in self.dataset_configs["train"]["target"]:  # webdataset no need for shuffle=True
+            return DataLoader(train_ds, batch_size=self.batch_size, num_workers=self.num_workers, pin_memory=True)
+        # IterableDataset shuffles inside __iter__; DataLoader must not shuffle
+        shuffle = not isinstance(train_ds, IterableDataset)
+        return DataLoader(train_ds, batch_size=self.batch_size,
+                          num_workers=self.num_workers, shuffle=shuffle, collate_fn=custom_collate, pin_memory=True)
 
     def _val_dataloader(self):
         return DataLoader(self.datasets["validation"],
